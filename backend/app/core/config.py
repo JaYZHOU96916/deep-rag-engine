@@ -38,6 +38,15 @@ class Settings(BaseSettings):
     reranker_min_score: float = 0.05
     semantic_cache_threshold: float = 0.95
     semantic_cache_ttl_seconds: int = 86_400
+    sse_replay_ttl_seconds: int = 3_600
+    llm_provider: Literal["local", "openai", "deepseek", "claude"] = "local"
+    llm_model: str = "gpt-4.1-mini"
+    llm_temperature: float = 0.1
+    openai_api_key: SecretStr | None = None
+    openai_base_url: str = "https://api.openai.com/v1"
+    deepseek_api_key: SecretStr | None = None
+    deepseek_base_url: str = "https://api.deepseek.com/v1"
+    claude_api_key: SecretStr | None = None
 
     @field_validator("cors_origins", mode="before")
     @classmethod
