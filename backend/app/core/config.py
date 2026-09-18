@@ -29,6 +29,15 @@ class Settings(BaseSettings):
     embedding_base_url: str | None = None
     embedding_api_key: SecretStr | None = None
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
+    dense_candidate_limit: int = 24
+    sparse_candidate_limit: int = 24
+    rrf_k: int = 60
+    reranker_provider: Literal["lexical", "bge_http"] = "lexical"
+    reranker_endpoint: str | None = None
+    reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    reranker_min_score: float = 0.05
+    semantic_cache_threshold: float = 0.95
+    semantic_cache_ttl_seconds: int = 86_400
 
     @field_validator("cors_origins", mode="before")
     @classmethod

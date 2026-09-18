@@ -12,8 +12,10 @@ PyMuPDF>=1.24,<2.0
 python-multipart>=0.0.18,<1.0
 aiofiles>=24.1,<25.0
 openai>=1.60,<2.0
+rank-bm25>=0.2.2,<1.0
 
 # Test dependencies
 pytest>=8.3,<9.0
 pytest-asyncio>=0.24,<1.0
 httpx>=0.28,<1.0
+fakeredis>=2.26,<3.0
