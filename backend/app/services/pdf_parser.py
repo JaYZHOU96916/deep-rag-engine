@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-import fitz
+import pymupdf
 
 
 class PDFExtractionError(ValueError):
@@ -32,8 +32,8 @@ class PDFParser:
     @staticmethod
     def parse(file_path: Path) -> ParsedPDF:
         try:
-            pdf = fitz.open(file_path)
-        except (fitz.FileDataError, RuntimeError) as exc:
+            pdf = pymupdf.open(file_path)
+        except (pymupdf.FileDataError, RuntimeError) as exc:
             raise PDFExtractionError("The uploaded file is not a readable PDF.") from exc
 
         try:

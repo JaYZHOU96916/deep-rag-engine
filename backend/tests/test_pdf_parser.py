@@ -1,13 +1,13 @@
 from pathlib import Path
 
-import fitz
+import pymupdf
 
 from app.services.pdf_parser import PDFParser
 
 
 def test_pdf_parser_preserves_one_based_page_metadata(tmp_path: Path) -> None:
     pdf_path = tmp_path / "paper.pdf"
-    pdf = fitz.open()
+    pdf = pymupdf.open()
     first = pdf.new_page()
     first.insert_text((72, 72), "First page abstract.")
     second = pdf.new_page()

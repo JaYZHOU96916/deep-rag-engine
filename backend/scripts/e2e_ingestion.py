@@ -7,14 +7,14 @@ import time
 import os
 from pathlib import Path
 
-import fitz
+import pymupdf
 import httpx
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 
 
 def build_fixture(path: Path) -> None:
-    pdf = fitz.open()
+    pdf = pymupdf.open()
     for text in (
         "Deep retrieval augments academic document research with citations.",
         "A second page verifies page-level provenance is retained during ingestion.",
