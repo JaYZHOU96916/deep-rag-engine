@@ -99,6 +99,8 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:${BACKEND_PORT:-8000}}
     <<: *restart-policy
     environment:
       NEXT_PUBLIC_API_BASE_URL: http://localhost:${BACKEND_PORT:-8000}
@@ -107,7 +109,7 @@ services:
     depends_on:
       backend:
         condition: service_healthy
-    command: ["npm", "run", "dev", "--", "--hostname", "0.0.0.0"]
+    command: ["node", "server.js"]
 
 volumes:
   postgres_data:

@@ -1,0 +1,338 @@
+"use client";
+
+import { ChangeEvent, DragEvent, FormEvent, ReactNode, useMemo, useRef, useState } from "react";
+
+type Provider = "local" | "openai" | "deepseek" | "claude";
+
+type Citation = {
+  chunk_id: string;
+  document_id: string;
+  document_name: string;
+  page_number: number;
+  excerpt: string;
+  rrf_score: number;
+  rerank_score: number;
+};
+
+type Thought = {
+  stage: string;
+  summary: string;
+  subqueries?: string[];
+  cache_hit?: boolean;
+};
+
+type DocumentProgress = {
+  id: string;
+  original_filename: string;
+  status: string;
+  page_count: number | null;
+  chunk_count: number;
+  error_message: string | null;
+};
+
+type SSEFrame = {
+  id: number;
+  event: "thought" | "citation" | "delta" | "error";
+  data: Thought | Citation | { text: string; cache_hit: boolean } | { message: string };
+};
+
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
+const citationPattern = /(\[Ref: ([0-9a-fA-F-]{36}), Page (\d+)\])/g;
+
+export default function EvidenceWorkbench() {
+  const [question, setQuestion] = useState("");
+  const [answer, setAnswer] = useState("");
+  const [thoughts, setThoughts] = useState<Thought[]>([]);
+  const [citations, setCitations] = useState<Citation[]>([]);
+  const [selectedCitation, setSelectedCitation] = useState<Citation | null>(null);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [isThoughtOpen, setIsThoughtOpen] = useState(true);
+  const [streamId, setStreamId] = useState<string | null>(null);
+  const lastEventId = useRef(0);
+  const [error, setError] = useState<string | null>(null);
+  const [provider, setProvider] = useState<Provider>("local");
+  const [model, setModel] = useState("");
+  const [documentProgress, setDocumentProgress] = useState<DocumentProgress | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null);
+
+  const groupedCitations = useMemo(() => {
+    return citations.reduce<Record<string, Citation[]>>((groups, citation) => {
+      groups[citation.document_name] = [...(groups[citation.document_name] ?? []), citation];
+      return groups;
+    }, {});
+  }, [citations]);
+
+  async function handleUpload(file: File) {
+    if (!file.name.toLowerCase().endsWith(".pdf")) {
+      setError("请选择 PDF 文件。系统会保留原始页码作为引用依据。");
+      return;
+    }
+    setError(null);
+    setDocumentProgress({
+      id: "pending",
+      original_filename: file.name,
+      status: "uploading",
+      page_count: null,
+      chunk_count: 0,
+      error_message: null,
+    });
+    const body = new FormData();
+    body.append("file", file);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/v1/documents`, { method: "POST", body });
+      if (!response.ok) throw new Error(await response.text());
+      const uploaded = (await response.json()) as { id: string; status: string };
+      await pollDocument(uploaded.id, file.name);
+    } catch {
+      setError("上传未完成。请确认后端服务正在运行后再试。");
+      setDocumentProgress(null);
+    }
+  }
+
+  async function pollDocument(id: string, fallbackName: string) {
+    for (let attempt = 0; attempt < 90; attempt += 1) {
+      const response = await fetch(`${API_BASE_URL}/api/v1/documents/${id}`);
+      if (!response.ok) throw new Error("Unable to obtain ingestion progress");
+      const document = (await response.json()) as DocumentProgress;
+      setDocumentProgress({ ...document, original_filename: document.original_filename || fallbackName });
+      if (document.status === "completed" || document.status === "failed") return;
+      await new Promise((resolve) => window.setTimeout(resolve, 1000));
+    }
+    setError("文档仍在处理中。稍后刷新可继续查看摄取状态。");
+  }
+
+  function onFileInput(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (file) void handleUpload(file);
+    event.target.value = "";
+  }
+
+  function onDrop(event: DragEvent<HTMLButtonElement>) {
+    event.preventDefault();
+    setIsDragging(false);
+    const file = event.dataTransfer.files[0];
+    if (file) void handleUpload(file);
+  }
+
+  async function ask(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!question.trim() || isStreaming) return;
+    setAnswer("");
+    setThoughts([]);
+    setCitations([]);
+    setSelectedCitation(null);
+    setError(null);
+    setIsStreaming(true);
+    lastEventId.current = 0;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/v1/chat/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          question,
+          route: { provider, model: model || null },
+          use_semantic_cache: true,
+        }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const nextStreamId = response.headers.get("X-Stream-ID");
+      setStreamId(nextStreamId);
+      await consumeSSE(response, applyFrame);
+    } catch {
+      setError("连接在生成过程中中断。可以使用“续接流”重放已生成内容。");
+    } finally {
+      setIsStreaming(false);
+    }
+  }
+
+  async function resumeStream() {
+    if (!streamId || isStreaming) return;
+    setError(null);
+    setIsStreaming(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/v1/chat/stream/${streamId}`, {
+        headers: { "Last-Event-ID": String(lastEventId.current) },
+      });
+      if (!response.ok) throw new Error(await response.text());
+      await consumeSSE(response, applyFrame);
+    } catch {
+      setError("该流已过期，或暂时无法从服务端重放。");
+    } finally {
+      setIsStreaming(false);
+    }
+  }
+
+  function applyFrame(frame: SSEFrame) {
+    lastEventId.current = frame.id;
+    if (frame.event === "thought") {
+      setThoughts((current) => [...current, frame.data as Thought]);
+    } else if (frame.event === "citation") {
+      const citation = frame.data as Citation;
+      setCitations((current) => (current.some((item) => item.chunk_id === citation.chunk_id) ? current : [...current, citation]));
+    } else if (frame.event === "delta") {
+      setAnswer((current) => current + (frame.data as { text: string }).text);
+    } else {
+      setError((frame.data as { message: string }).message);
+    }
+  }
+
+  return (
+    <main className="mx-auto min-h-screen max-w-[1600px] px-4 py-5 sm:px-8 lg:px-10">
+      <header className="mb-6 flex flex-wrap items-center justify-between gap-4 border-b border-ink/15 pb-5">
+        <div className="flex items-center gap-4">
+          <div className="grid h-11 w-11 place-items-center border-2 border-ink bg-paper text-lg font-semibold text-ink">DR</div>
+          <div>
+            <p className="text-xs font-semibold tracking-[0.2em] text-verify">EVIDENCE WORKBENCH</p>
+            <h1 className="evidence-serif text-2xl font-semibold tracking-tight text-ink">Deep-RAG 学术文档知识库</h1>
+          </div>
+        </div>
+        <div className="flex items-center gap-3 text-sm text-ink/70">
+          <span className="inline-flex items-center gap-2"><i className="h-2 w-2 rounded-full bg-verify" />引文约束已启用</span>
+          {documentProgress?.status === "completed" && <span>{documentProgress.chunk_count} 个可检索片段</span>}
+        </div>
+      </header>
+
+      <section className="mb-6 grid gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
+        <form onSubmit={ask} className="border border-ink/20 bg-paper p-4 shadow-ledger sm:p-5">
+          <label htmlFor="question" className="mb-2 block text-sm font-semibold text-ink">向证据库提问</label>
+          <textarea
+            id="question"
+            value={question}
+            onChange={(event) => setQuestion(event.target.value)}
+            placeholder="例如：文档摄取过程中如何保留页码级来源信息？"
+            className="min-h-24 w-full resize-y border border-ink/20 bg-white px-3 py-3 text-[15px] leading-6 text-ink placeholder:text-ink/40"
+          />
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex flex-wrap gap-2">
+              <select aria-label="模型提供方" value={provider} onChange={(event) => setProvider(event.target.value as Provider)} className="border border-ink/20 bg-white px-2 py-2 text-sm">
+                <option value="local">本地验证模式</option>
+                <option value="openai">OpenAI</option>
+                <option value="deepseek">DeepSeek</option>
+                <option value="claude">Claude</option>
+              </select>
+              <input aria-label="模型名称" value={model} onChange={(event) => setModel(event.target.value)} placeholder="可选：覆盖模型名称" className="w-44 border border-ink/20 bg-white px-2 py-2 text-sm" />
+            </div>
+            <button type="submit" disabled={!question.trim() || isStreaming} className="bg-ink px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-signal disabled:cursor-not-allowed disabled:bg-ink/35">
+              {isStreaming ? "正在核对证据…" : "开始研读"}
+            </button>
+          </div>
+        </form>
+
+        <button
+          type="button"
+          onClick={() => fileInput.current?.click()}
+          onDragEnter={() => setIsDragging(true)}
+          onDragLeave={() => setIsDragging(false)}
+          onDragOver={(event) => event.preventDefault()}
+          onDrop={onDrop}
+          className={`min-h-40 border-2 border-dashed p-5 text-left transition-colors ${isDragging ? "border-signal bg-signal/5" : "border-ink/25 bg-fog/45 hover:border-verify"}`}
+        >
+          <span className="mb-5 block text-2xl text-verify">↥</span>
+          <span className="block text-sm font-semibold text-ink">导入 PDF</span>
+          <span className="mt-1 block text-sm leading-5 text-ink/65">拖放长文档，后台会解析页码、段落与语义切片。</span>
+          <input ref={fileInput} type="file" accept="application/pdf,.pdf" onChange={onFileInput} className="hidden" />
+        </button>
+      </section>
+
+      {documentProgress && <IngestionLedger document={documentProgress} />}
+      {error && <div className="mb-5 border-l-4 border-marker bg-marker/10 px-4 py-3 text-sm text-ink">{error}</div>}
+
+      <section className="grid gap-6 lg:grid-cols-[minmax(0,1.35fr)_minmax(300px,0.65fr)]">
+        <article className="min-h-[570px] border border-ink/20 bg-paper shadow-ledger">
+          <div className="flex items-center justify-between border-b border-ink/15 px-5 py-4">
+            <div>
+              <p className="text-sm font-semibold text-ink">研读记录</p>
+              <p className="mt-0.5 text-xs text-ink/55">先展示检索依据，再呈现经引文约束的回答。</p>
+            </div>
+            {thoughts.some((thought) => thought.cache_hit) && <span className="border border-verify/40 bg-verify/10 px-2 py-1 text-xs font-semibold text-verify">CACHE HIT</span>}
+          </div>
+
+          <div className="p-5 sm:p-7">
+            {thoughts.length > 0 && (
+              <section className="mb-7 border-l-2 border-signal/55 pl-4">
+                <button type="button" onClick={() => setIsThoughtOpen((open) => !open)} className="flex w-full items-center justify-between gap-3 text-left">
+                  <span className="text-sm font-semibold text-ink">检索过程</span>
+                  <span className="text-xs text-ink/55">{isThoughtOpen ? "收起" : "展开"}</span>
+                </button>
+                {isThoughtOpen && <ol className="mt-3 space-y-3">{thoughts.map((thought, index) => <li key={`${thought.stage}-${index}`} className="text-sm leading-6 text-ink/75"><span className="mr-2 font-semibold text-signal">{String(index + 1).padStart(2, "0")}</span>{thought.summary}{thought.subqueries?.map((query) => <span key={query} className="mt-1 block border-l border-ink/15 pl-3 text-xs text-ink/55">{query}</span>)}</li>)}</ol>}
+              </section>
+            )}
+
+            {!answer && !isStreaming && <EmptyAnswer />}
+            {(answer || isStreaming) && <div className={`evidence-serif max-w-[76ch] whitespace-pre-wrap text-[18px] leading-8 text-ink ${isStreaming ? "live-cursor" : ""}`}><CitationText text={answer} citations={citations} onSelect={setSelectedCitation} /></div>}
+          </div>
+
+          {streamId && <div className="border-t border-ink/15 px-5 py-3 text-right"><button type="button" onClick={() => void resumeStream()} disabled={isStreaming} className="text-xs font-semibold text-verify underline decoration-verify/35 underline-offset-4 disabled:text-ink/35">从事件 #{lastEventId.current} 续接流</button></div>}
+        </article>
+
+        <aside className="border border-ink/20 bg-fog/35 p-5">
+          <div className="mb-5 border-b border-ink/15 pb-4">
+            <p className="text-sm font-semibold text-ink">证据分布</p>
+            <p className="mt-1 text-xs leading-5 text-ink/55">按原始文件与页码组织；选择引文即可查看对应片段。</p>
+          </div>
+          {Object.keys(groupedCitations).length === 0 ? <EmptyEvidence /> : <EvidenceMap groups={groupedCitations} selected={selectedCitation} onSelect={setSelectedCitation} />}
+          {selectedCitation && <SelectedExcerpt citation={selectedCitation} />}
+        </aside>
+      </section>
+    </main>
+  );
+}
+
+function IngestionLedger({ document }: { document: DocumentProgress }) {
+  const labels: Record<string, string> = { uploading: "正在上传", pending: "等待任务队列", parsing: "提取页码与段落", chunking: "递归切片", embedding: "写入语义向量", completed: "已可检索", failed: "摄取失败" };
+  const complete = document.status === "completed";
+  return <section className="mb-5 flex flex-wrap items-center justify-between gap-3 border border-ink/15 bg-paper px-4 py-3 text-sm"><div><span className="font-semibold text-ink">{document.original_filename}</span><span className="ml-3 text-ink/55">{labels[document.status] ?? document.status}</span></div><div className={complete ? "font-semibold text-verify" : "text-ink/60"}>{document.page_count ? `${document.page_count} 页 · ${document.chunk_count} 片段` : "页码信息准备中"}</div></section>;
+}
+
+function EmptyAnswer() {
+  return <div className="py-20 text-center"><p className="evidence-serif text-2xl text-ink/65">问题会从证据开始。</p><p className="mx-auto mt-3 max-w-md text-sm leading-6 text-ink/50">上传 PDF 后提出具体问题；系统将返回可展开到页码和原文片段的回答。</p></div>;
+}
+
+function EmptyEvidence() {
+  return <div className="border border-dashed border-ink/20 px-4 py-8 text-center text-sm leading-6 text-ink/55">尚未生成证据地图。<br />答案中的每一条引用都会在这里留下来源轨迹。</div>;
+}
+
+function EvidenceMap({ groups, selected, onSelect }: { groups: Record<string, Citation[]>; selected: Citation | null; onSelect: (citation: Citation) => void }) {
+  return <div className="space-y-5">{Object.entries(groups).map(([document, items]) => <section key={document}><div className="mb-2 flex items-baseline justify-between gap-3"><h2 className="max-w-[18ch] truncate text-sm font-semibold text-ink">{document}</h2><span className="text-xs text-ink/50">{items.length} 条依据</span></div><div className="flex flex-wrap gap-2">{items.map((citation) => <button key={citation.chunk_id} type="button" onClick={() => onSelect(citation)} className={`border px-2.5 py-1.5 text-xs transition-colors ${selected?.chunk_id === citation.chunk_id ? "border-signal bg-signal text-white" : "border-ink/20 bg-paper text-ink hover:border-verify"}`}>p. {citation.page_number}</button>)}</div></section>)}</div>;
+}
+
+function SelectedExcerpt({ citation }: { citation: Citation }) {
+  return <section className="mt-7 border-t border-ink/15 pt-5"><p className="mb-2 text-xs font-semibold tracking-[0.12em] text-verify">SOURCE EXCERPT · PAGE {citation.page_number}</p><blockquote className="evidence-serif border-l-2 border-marker pl-3 text-sm leading-6 text-ink/80">{citation.excerpt}</blockquote><p className="mt-3 text-xs text-ink/50">RRF {citation.rrf_score.toFixed(4)} · rerank {citation.rerank_score.toFixed(3)}</p></section>;
+}
+
+function CitationText({ text, citations, onSelect }: { text: string; citations: Citation[]; onSelect: (citation: Citation) => void }) {
+  const nodes: ReactNode[] = [];
+  let cursor = 0;
+  for (const match of text.matchAll(citationPattern)) {
+    const [label, documentId, page] = match;
+    const start = match.index ?? 0;
+    if (start > cursor) nodes.push(<span key={`text-${cursor}`}>{text.slice(cursor, start)}</span>);
+    const citation = citations.find((item) => item.document_id === documentId && item.page_number === Number(page));
+    nodes.push(citation ? <button key={`citation-${start}`} type="button" onClick={() => onSelect(citation)} className="citation-link">{label}</button> : <span key={`citation-${start}`}>{label}</span>);
+    cursor = start + label.length;
+  }
+  if (cursor < text.length) nodes.push(<span key={`text-${cursor}`}>{text.slice(cursor)}</span>);
+  return <>{nodes}</>;
+}
+
+async function consumeSSE(response: Response, onFrame: (frame: SSEFrame) => void) {
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("Response body is unavailable");
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+    const frames = buffer.split("\n\n");
+    buffer = frames.pop() ?? "";
+    for (const rawFrame of frames) {
+      const fields: Record<string, string> = Object.fromEntries(rawFrame.split("\n").filter(Boolean).map((line) => {
+        const [key, ...rest] = line.split(": ");
+        return [key, rest.join(": ")];
+      }));
+      if (fields.event && fields.data && fields.id) onFrame({ id: Number(fields.id), event: fields.event as SSEFrame["event"], data: JSON.parse(fields.data) });
+    }
+    if (done) return;
+  }
+}
