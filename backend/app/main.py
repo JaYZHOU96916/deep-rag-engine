@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes.documents import router as documents_router
 from app.api.routes.chat import router as chat_router
+from app.api.routes.papers import router as papers_router
 from app.api.routes.retrieval import router as retrieval_router
 from app.core.config import get_settings
 
@@ -17,6 +18,7 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization", "Last-Event-ID"],
 )
 app.include_router(documents_router, prefix="/api/v1")
+app.include_router(papers_router, prefix="/api/v1")
 app.include_router(retrieval_router, prefix="/api/v1")
 app.include_router(chat_router, prefix="/api/v1")
 

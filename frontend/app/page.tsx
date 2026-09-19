@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, DragEvent, FormEvent, ReactNode, useMemo, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
 type Provider = "local" | "openai" | "deepseek" | "claude";
 
@@ -36,6 +36,33 @@ type SSEFrame = {
   data: Thought | Citation | { text: string; cache_hit: boolean } | { message: string };
 };
 
+type Institution = {
+  id: string;
+  name: string;
+};
+
+type Paper = {
+  title: string;
+  authors: string[];
+  publication_year: number | null;
+  abstract: string | null;
+  doi: string | null;
+  landing_page_url: string | null;
+  open_access_url: string | null;
+  open_access_pdf_url: string | null;
+  citation_count: number | null;
+  sources: string[];
+  access_type: "open_access" | "institution_login" | "metadata_only";
+  institution_name: string | null;
+  institution_access_url: string | null;
+};
+
+type PaperSearchResponse = {
+  query: string;
+  is_doi_lookup: boolean;
+  results: Paper[];
+};
+
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
 const citationPattern = /(\[Ref: ([0-9a-fA-F-]{36}), Page (\d+)\])/g;
 
@@ -54,6 +81,14 @@ export default function EvidenceWorkbench() {
   const [model, setModel] = useState("");
   const [documentProgress, setDocumentProgress] = useState<DocumentProgress | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+  const [paperQuery, setPaperQuery] = useState("");
+  const [institutions, setInstitutions] = useState<Institution[]>([]);
+  const [institutionId, setInstitutionId] = useState("");
+  const [paperResults, setPaperResults] = useState<Paper[]>([]);
+  const [isPaperSearching, setIsPaperSearching] = useState(false);
+  const [paperSearchComplete, setPaperSearchComplete] = useState(false);
+  const [paperError, setPaperError] = useState<string | null>(null);
+  const [importingPdfUrl, setImportingPdfUrl] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
 
   const groupedCitations = useMemo(() => {
@@ -62,6 +97,20 @@ export default function EvidenceWorkbench() {
       return groups;
     }, {});
   }, [citations]);
+
+  useEffect(() => {
+    void loadInstitutions();
+  }, []);
+
+  async function loadInstitutions() {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/v1/papers/institutions`);
+      if (!response.ok) return;
+      setInstitutions((await response.json()) as Institution[]);
+    } catch {
+      // Paper discovery remains useful without a configured institutional connector.
+    }
+  }
 
   async function handleUpload(file: File) {
     if (!file.name.toLowerCase().endsWith(".pdf")) {
@@ -113,6 +162,61 @@ export default function EvidenceWorkbench() {
     setIsDragging(false);
     const file = event.dataTransfer.files[0];
     if (file) void handleUpload(file);
+  }
+
+  async function searchPapers(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const query = paperQuery.trim();
+    if (query.length < 2 || isPaperSearching) return;
+    setPaperError(null);
+    setPaperResults([]);
+    setPaperSearchComplete(false);
+    setIsPaperSearching(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/v1/papers/search`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query, limit: 6, institution_id: institutionId || null }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = (await response.json()) as PaperSearchResponse;
+      setPaperResults(payload.results);
+      setPaperSearchComplete(true);
+    } catch {
+      setPaperError("论文检索暂时不可用。请检查网络后重试，或直接输入 DOI。\n");
+    } finally {
+      setIsPaperSearching(false);
+    }
+  }
+
+  async function importOpenAccessPdf(paper: Paper) {
+    if (!paper.open_access_pdf_url || importingPdfUrl) return;
+    setPaperError(null);
+    setError(null);
+    setImportingPdfUrl(paper.open_access_pdf_url);
+    setDocumentProgress({
+      id: "pending",
+      original_filename: `${paper.title}.pdf`,
+      status: "downloading",
+      page_count: null,
+      chunk_count: 0,
+      error_message: null,
+    });
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/v1/papers/import`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pdf_url: paper.open_access_pdf_url, title: paper.title }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const uploaded = (await response.json()) as { id: string; status: string };
+      await pollDocument(uploaded.id, `${paper.title}.pdf`);
+    } catch {
+      setError("开放 PDF 未能自动导入。可打开开放版本并下载后，再拖拽到导入区。");
+      setDocumentProgress(null);
+    } finally {
+      setImportingPdfUrl(null);
+    }
   }
 
   async function ask(event: FormEvent<HTMLFormElement>) {
@@ -192,6 +296,43 @@ export default function EvidenceWorkbench() {
           {documentProgress?.status === "completed" && <span>{documentProgress.chunk_count} 个可检索片段</span>}
         </div>
       </header>
+
+      <section className="mb-6 border border-ink/20 bg-paper shadow-ledger" aria-labelledby="paper-discovery-heading">
+        <div className="grid gap-5 p-5 lg:grid-cols-[minmax(0,1fr)_300px] lg:items-end">
+          <div>
+            <p className="mb-1 text-sm font-semibold text-ink" id="paper-discovery-heading">论文发现</p>
+            <p className="max-w-2xl text-sm leading-6 text-ink/60">输入关键词、论文题目或 DOI。可将开放 PDF 直接入库；学校检索只会跳转至官方页面，不会读取校园账号。</p>
+          </div>
+          <p className="border-l-2 border-verify/50 pl-3 text-xs leading-5 text-ink/60">DOI 精确解析 · OpenAlex + Crossref 元数据 · 学校访问可选</p>
+        </div>
+        <form onSubmit={searchPapers} className="grid gap-2 border-t border-ink/15 p-4 sm:grid-cols-[minmax(0,1fr)_auto_auto] sm:p-5">
+          <label className="sr-only" htmlFor="paper-query">论文关键词、题目或 DOI</label>
+          <input
+            id="paper-query"
+            value={paperQuery}
+            onChange={(event) => setPaperQuery(event.target.value)}
+            placeholder="例如：retrieval augmented generation，或 10.1038/s41586-023-06221-2"
+            className="min-w-0 border border-ink/20 bg-white px-3 py-2.5 text-sm text-ink placeholder:text-ink/40"
+          />
+          <select aria-label="可选学校图书馆" value={institutionId} onChange={(event) => setInstitutionId(event.target.value)} className="border border-ink/20 bg-white px-3 py-2.5 text-sm text-ink">
+            <option value="">不使用学校图书馆</option>
+            {institutions.map((institution) => <option key={institution.id} value={institution.id}>{institution.name}</option>)}
+          </select>
+          <button type="submit" disabled={paperQuery.trim().length < 2 || isPaperSearching} className="bg-verify px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-ink disabled:cursor-not-allowed disabled:bg-verify/40">
+            {isPaperSearching ? "正在检索…" : "搜索论文"}
+          </button>
+        </form>
+        {paperError && <p role="alert" className="border-t border-marker/30 bg-marker/10 px-5 py-3 text-sm text-ink">{paperError}</p>}
+        {paperSearchComplete && (
+          <div className="border-t border-ink/15" aria-live="polite">
+            {paperResults.length === 0 ? (
+              <p className="px-5 py-7 text-sm leading-6 text-ink/60">未找到匹配记录。尝试更完整的题名、作者和年份，或直接输入 DOI。</p>
+            ) : (
+              <ol className="divide-y divide-ink/15">{paperResults.map((paper, index) => <PaperRecord key={`${paper.doi ?? paper.title}-${index}`} paper={paper} onImport={importOpenAccessPdf} isImporting={importingPdfUrl === paper.open_access_pdf_url} />)}</ol>
+            )}
+          </div>
+        )}
+      </section>
 
       <section className="mb-6 grid gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
         <form onSubmit={ask} className="border border-ink/20 bg-paper p-4 shadow-ledger sm:p-5">
@@ -280,9 +421,33 @@ export default function EvidenceWorkbench() {
 }
 
 function IngestionLedger({ document }: { document: DocumentProgress }) {
-  const labels: Record<string, string> = { uploading: "正在上传", pending: "等待任务队列", parsing: "提取页码与段落", chunking: "递归切片", embedding: "写入语义向量", completed: "已可检索", failed: "摄取失败" };
+  const labels: Record<string, string> = { downloading: "正在导入开放 PDF", uploading: "正在上传", pending: "等待任务队列", parsing: "提取页码与段落", chunking: "递归切片", embedding: "写入语义向量", completed: "已可检索", failed: "摄取失败" };
   const complete = document.status === "completed";
   return <section className="mb-5 flex flex-wrap items-center justify-between gap-3 border border-ink/15 bg-paper px-4 py-3 text-sm"><div><span className="font-semibold text-ink">{document.original_filename}</span><span className="ml-3 text-ink/55">{labels[document.status] ?? document.status}</span></div><div className={complete ? "font-semibold text-verify" : "text-ink/60"}>{document.page_count ? `${document.page_count} 页 · ${document.chunk_count} 片段` : "页码信息准备中"}</div></section>;
+}
+
+function PaperRecord({ paper, onImport, isImporting }: { paper: Paper; onImport: (paper: Paper) => void; isImporting: boolean }) {
+  const access = paper.access_type === "open_access"
+    ? { label: "开放版本", className: "border-verify/40 bg-verify/10 text-verify" }
+    : paper.access_type === "institution_login"
+      ? { label: "需学校登录", className: "border-signal/40 bg-signal/10 text-signal" }
+      : { label: "仅元数据", className: "border-ink/20 bg-fog text-ink/65" };
+  const authorLine = paper.authors.slice(0, 4).join("、") || "作者信息未提供";
+  const primaryUrl = paper.open_access_url || paper.landing_page_url;
+  return <li className="grid gap-4 px-5 py-5 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
+    <div className="min-w-0">
+      <div className="mb-2 flex flex-wrap items-center gap-2"><span className={`border px-2 py-1 text-xs font-semibold ${access.className}`}>{access.label}</span>{paper.sources.map((source) => <span key={source} className="text-xs text-ink/50">{source}</span>)}</div>
+      <h2 className="evidence-serif max-w-4xl text-lg font-semibold leading-6 text-ink">{paper.title}</h2>
+      <p className="mt-2 text-sm text-ink/65">{authorLine}{paper.publication_year ? ` · ${paper.publication_year}` : ""}{paper.citation_count !== null ? ` · ${paper.citation_count.toLocaleString()} citations` : ""}</p>
+      {paper.doi && <p className="mt-2 break-all text-xs text-ink/50">DOI {paper.doi}</p>}
+      {paper.abstract && <p className="mt-3 line-clamp-3 max-w-4xl text-sm leading-6 text-ink/70">{paper.abstract}</p>}
+    </div>
+    <div className="flex shrink-0 flex-wrap gap-2 lg:max-w-48 lg:justify-end">
+      {primaryUrl && <a href={primaryUrl} target="_blank" rel="noreferrer" className="border border-ink/20 bg-white px-3 py-2 text-xs font-semibold text-ink transition-colors hover:border-verify hover:text-verify">{paper.open_access_url ? "打开开放版本" : "查看出处"}</a>}
+      {paper.open_access_pdf_url && <button type="button" onClick={() => void onImport(paper)} disabled={isImporting} className="border border-verify bg-verify px-3 py-2 text-xs font-semibold text-white transition-colors hover:bg-ink disabled:cursor-not-allowed disabled:bg-verify/45">{isImporting ? "正在导入…" : "导入开放 PDF"}</button>}
+      {paper.institution_access_url && <a href={paper.institution_access_url} target="_blank" rel="noreferrer" className="border border-signal/35 bg-signal/5 px-3 py-2 text-xs font-semibold text-signal transition-colors hover:bg-signal hover:text-white">在 {paper.institution_name} 检索</a>}
+    </div>
+  </li>;
 }
 
 function EmptyAnswer() {

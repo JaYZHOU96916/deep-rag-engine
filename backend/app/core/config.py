@@ -8,6 +8,15 @@ from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+DEFAULT_INSTITUTION_CONNECTORS_JSON = """[
+  {
+    "id": "unimelb",
+    "name": "University of Melbourne",
+    "catalog_search_url_template": "https://librarysearch.unimelb.edu.au/nde/search?vid=61UMB_INST%3ANDE&query={query}"
+  }
+]"""
+
+
 class Settings(BaseSettings):
     """Runtime configuration loaded from environment variables only."""
 
@@ -54,6 +63,11 @@ class Settings(BaseSettings):
     deepseek_api_key: SecretStr | None = None
     deepseek_base_url: str = "https://api.deepseek.com/v1"
     claude_api_key: SecretStr | None = None
+    paper_search_timeout_seconds: float = Field(default=8.0, ge=1.0, le=30.0)
+    paper_search_max_results: int = Field(default=8, ge=1, le=20)
+    crossref_mailto: str | None = None
+    openalex_api_key: SecretStr | None = None
+    institution_connectors_json: str = DEFAULT_INSTITUTION_CONNECTORS_JSON
 
     @field_validator("cors_origins", mode="before")
     @classmethod

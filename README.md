@@ -12,6 +12,7 @@ Deep-RAG 是一个以“可回到原始页码的证据”为核心的学术 PDF 
 - 强制引用提示词与服务端引文守卫：回答仅保留具有已检索 `Ref + Page` 对应关系的句子。
 - Typed SSE：`thought`、`citation`、`delta`、`error` 四类 JSON 帧写入 Redis，可使用 `Last-Event-ID` 续接断开的浏览器连接。
 - Next.js 15 双栏证据工作台：上传与摄取进度、可收起检索过程、可点击页码引文、源片段与文档分布并列呈现。
+- 论文发现台：关键词或 DOI 并行查询 OpenAlex 与 Crossref；开放版本可直接打开，学校连接器只跳转官方 Library Search / OpenURL，不接触用户 SSO 凭据。
 
 ## 架构
 
@@ -75,6 +76,9 @@ cp .env.example .env
 | `POST` | `/api/v1/documents` | 上传 PDF，立即返回文档 ID 与 Celery task ID |
 | `GET` | `/api/v1/documents/{document_id}` | 轮询 `pending → parsing → chunking → embedding → completed` |
 | `POST` | `/api/v1/retrieval/search` | 调试混合检索与返回页码级引用 |
+| `GET` | `/api/v1/papers/institutions` | 返回已配置的学校图书馆连接器 |
+| `POST` | `/api/v1/papers/search` | 关键词或 DOI 论文发现；可附带学校 ID 生成官方访问链接 |
+| `POST` | `/api/v1/papers/import` | 仅下载并摄取论文发现结果提供的开放 PDF；拒绝私网地址、非 HTTPS、超限或非 PDF 内容 |
 | `POST` | `/api/v1/chat/stream` | 创建 Typed SSE 流，响应头返回 `X-Stream-ID` |
 | `GET` | `/api/v1/chat/stream/{stream_id}` | 携带 `Last-Event-ID` 回放未接收帧 |
 
@@ -101,6 +105,22 @@ RRF(d) = Σ 1 / (k + rank_i(d)),  k = 60
 ### 引用完整性
 
 生成阶段包含三层防护：HyDE 仅用于检索扩展；回答提示词强制每个事实性句子以 `[Ref: ID, Page X]` 收尾；Self-RAG 审核后，服务端只允许与本次候选片段匹配的 ID/页码对进入最终答案。证据不足时返回：`检索到的参考资料中未包含关于 [具体问题] 的确切信息。`
+
+## 论文发现与学校图书馆
+
+论文发现不依赖学校配置：普通关键词通过 OpenAlex 与 Crossref 查询，直接粘贴 DOI 则进行精确解析。结果明确区分三种访问状态：
+
+- `open_access`：显示来自元数据源的开放版本 URL；带有明确 PDF URL 的结果可一键进入现有 Celery 摄取流水线。
+- `institution_login`：生成学校官方的 OpenURL 或 Library Search 地址；浏览器在学校页面中自行执行 SSO，Deep-RAG 不代理登录、不保存密码、Cookie 或访问令牌。
+- `metadata_only`：仅显示书目信息和来源页，不能暗示全文可用。
+
+默认提供 University of Melbourne 的 Library Search 跳转。其他大学由部署管理员以 JSON 一次性配置；普通用户只需在论文发现台选择学校。若某校提供 OpenURL，可优先设置 `openurl_base_url`；若没有，提供带 `{query}` 占位符的 HTTPS 检索 URL 即可。
+
+```dotenv
+INSTITUTION_CONNECTORS_JSON='[{"id":"example-u","name":"Example University","catalog_search_url_template":"https://library.example.edu/search?q={query}","openurl_base_url":"https://resolver.example.edu/openurl?"}]'
+```
+
+`INSTITUTION_CONNECTORS_JSON` 是服务端受信配置，系统会拒绝非 HTTPS URL、缺少 `{query}` 的检索模板或重复学校 ID。开放 PDF 导入还会拒绝私网/回环 DNS、重定向链过长、超出上传上限和非 PDF 内容。该阶段不抓取订阅库网页，也不导入受限 PDF；OAI-PMH 元数据收割将在学校提供经过验证的公开 endpoint 后作为独立连接器加入。
 
 ## Typed SSE 协议
 
@@ -136,6 +156,8 @@ data: {"text":"正文片段","cache_hit":false}
 | `RERANKER_PROVIDER`, `RERANKER_ENDPOINT` | 设置为 `bge_http` 并指向受控 BGE/Cross-Encoder 服务以启用生产重排。 |
 | `SEMANTIC_CACHE_THRESHOLD`, `SEMANTIC_CACHE_TTL_SECONDS` | 缓存相似度阈值与存活时间。 |
 | `CORS_ORIGINS` | JSON 数组格式的允许前端来源列表。 |
+| `CROSSREF_MAILTO`, `OPENALEX_API_KEY` | 可选的公共论文元数据服务联系地址与 API Key；开发环境可留空。 |
+| `INSTITUTION_CONNECTORS_JSON` | 学校名称、HTTPS 检索模板和可选 OpenURL Resolver 的服务端 JSON 配置。 |
 
 ## 验证
 
@@ -150,6 +172,8 @@ docker compose --profile application run --rm --no-deps \
 docker compose --profile application run --rm --no-deps backend python scripts/e2e_retrieval.py
 docker compose --profile application run --rm --no-deps \
   -e API_BASE_URL=http://backend:8000 backend python scripts/e2e_sse.py
+docker compose --profile application run --rm --no-deps \
+  -e API_BASE_URL=http://backend:8000 backend python scripts/e2e_paper_discovery.py
 
 # 前端生产构建与类型检查
 cd frontend && npm ci && npm run lint && npm run build
