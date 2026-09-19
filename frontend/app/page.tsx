@@ -30,6 +30,38 @@ type DocumentProgress = {
   error_message: string | null;
 };
 
+type SummaryCitation = {
+  chunk_id: string;
+  page_number: number;
+};
+
+type SummaryClaim = {
+  english: string;
+  chinese: string;
+  citations: SummaryCitation[];
+};
+
+type BilingualSummaryData = {
+  english_summary: string;
+  chinese_summary: string;
+  overview_citations: SummaryCitation[];
+  key_findings: SummaryClaim[];
+  methods: SummaryClaim[];
+  limitations: SummaryClaim[];
+  translation_mode: "llm_bilingual" | "local_verification";
+};
+
+type BilingualSummaryResponse = {
+  document_id: string;
+  status: "pending" | "summarizing" | "completed" | "failed";
+  task_id: string | null;
+  source_chunk_count: number;
+  route_provider: Provider;
+  route_model: string;
+  error_message: string | null;
+  summary: BilingualSummaryData | null;
+};
+
 type SSEFrame = {
   id: number;
   event: "thought" | "citation" | "delta" | "error";
@@ -80,6 +112,10 @@ export default function EvidenceWorkbench() {
   const [provider, setProvider] = useState<Provider>("local");
   const [model, setModel] = useState("");
   const [documentProgress, setDocumentProgress] = useState<DocumentProgress | null>(null);
+  const [isBilingualSummaryEnabled, setIsBilingualSummaryEnabled] = useState(false);
+  const [bilingualSummary, setBilingualSummary] = useState<BilingualSummaryResponse | null>(null);
+  const [isSummaryPolling, setIsSummaryPolling] = useState(false);
+  const [summaryLanguage, setSummaryLanguage] = useState<"both" | "zh" | "en">("both");
   const [isDragging, setIsDragging] = useState(false);
   const [paperQuery, setPaperQuery] = useState("");
   const [institutions, setInstitutions] = useState<Institution[]>([]);
@@ -118,6 +154,8 @@ export default function EvidenceWorkbench() {
       return;
     }
     setError(null);
+    setBilingualSummary(null);
+    setIsBilingualSummaryEnabled(false);
     setDocumentProgress({
       id: "pending",
       original_filename: file.name,
@@ -149,6 +187,39 @@ export default function EvidenceWorkbench() {
       await new Promise((resolve) => window.setTimeout(resolve, 1000));
     }
     setError("文档仍在处理中。稍后刷新可继续查看摄取状态。");
+  }
+
+  async function requestBilingualSummary(regenerate: boolean) {
+    if (!documentProgress || documentProgress.status !== "completed" || isSummaryPolling) return;
+    setError(null);
+    setIsSummaryPolling(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/v1/documents/${documentProgress.id}/bilingual-summary`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ route: { provider, model: model || null }, regenerate }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const created = (await response.json()) as BilingualSummaryResponse;
+      setBilingualSummary(created);
+      if (created.status === "pending" || created.status === "summarizing") await pollBilingualSummary(documentProgress.id);
+    } catch {
+      setError("双语总结任务未能启动。请确认后端、任务队列和所选模型配置均可用后重试。");
+    } finally {
+      setIsSummaryPolling(false);
+    }
+  }
+
+  async function pollBilingualSummary(documentId: string) {
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      const response = await fetch(`${API_BASE_URL}/api/v1/documents/${documentId}/bilingual-summary`);
+      if (!response.ok) throw new Error("Unable to obtain bilingual summary progress");
+      const current = (await response.json()) as BilingualSummaryResponse;
+      setBilingualSummary(current);
+      if (current.status === "completed" || current.status === "failed") return;
+      await new Promise((resolve) => window.setTimeout(resolve, 1000));
+    }
+    setError("双语总结仍在生成中。稍后可再次开启此面板查看进度。");
   }
 
   function onFileInput(event: ChangeEvent<HTMLInputElement>) {
@@ -193,6 +264,8 @@ export default function EvidenceWorkbench() {
     if (!paper.open_access_pdf_url || importingPdfUrl) return;
     setPaperError(null);
     setError(null);
+    setBilingualSummary(null);
+    setIsBilingualSummaryEnabled(false);
     setImportingPdfUrl(paper.open_access_pdf_url);
     setDocumentProgress({
       id: "pending",
@@ -377,6 +450,17 @@ export default function EvidenceWorkbench() {
       </section>
 
       {documentProgress && <IngestionLedger document={documentProgress} />}
+      {documentProgress?.status === "completed" && (
+        <BilingualSummaryLedger
+          enabled={isBilingualSummaryEnabled}
+          onEnabledChange={setIsBilingualSummaryEnabled}
+          summary={bilingualSummary}
+          isPolling={isSummaryPolling}
+          language={summaryLanguage}
+          onLanguageChange={setSummaryLanguage}
+          onGenerate={() => void requestBilingualSummary(Boolean(bilingualSummary))}
+        />
+      )}
       {error && <div className="mb-5 border-l-4 border-marker bg-marker/10 px-4 py-3 text-sm text-ink">{error}</div>}
 
       <section className="grid gap-6 lg:grid-cols-[minmax(0,1.35fr)_minmax(300px,0.65fr)]">
@@ -424,6 +508,60 @@ function IngestionLedger({ document }: { document: DocumentProgress }) {
   const labels: Record<string, string> = { downloading: "正在导入开放 PDF", uploading: "正在上传", pending: "等待任务队列", parsing: "提取页码与段落", chunking: "递归切片", embedding: "写入语义向量", completed: "已可检索", failed: "摄取失败" };
   const complete = document.status === "completed";
   return <section className="mb-5 flex flex-wrap items-center justify-between gap-3 border border-ink/15 bg-paper px-4 py-3 text-sm"><div><span className="font-semibold text-ink">{document.original_filename}</span><span className="ml-3 text-ink/55">{labels[document.status] ?? document.status}</span></div><div className={complete ? "font-semibold text-verify" : "text-ink/60"}>{document.page_count ? `${document.page_count} 页 · ${document.chunk_count} 片段` : "页码信息准备中"}</div></section>;
+}
+
+function BilingualSummaryLedger({ enabled, onEnabledChange, summary, isPolling, language, onLanguageChange, onGenerate }: {
+  enabled: boolean;
+  onEnabledChange: (enabled: boolean) => void;
+  summary: BilingualSummaryResponse | null;
+  isPolling: boolean;
+  language: "both" | "zh" | "en";
+  onLanguageChange: (language: "both" | "zh" | "en") => void;
+  onGenerate: () => void;
+}) {
+  const inProgress = isPolling || summary?.status === "pending" || summary?.status === "summarizing";
+  const data = summary?.summary;
+  return <section className="mb-5 border border-ink/20 bg-paper shadow-ledger" aria-labelledby="bilingual-summary-heading">
+    <div className="flex flex-wrap items-center justify-between gap-4 p-4 sm:p-5">
+      <div>
+        <div className="flex items-center gap-3"><h2 id="bilingual-summary-heading" className="text-sm font-semibold text-ink">双语论文总结</h2><span className="border border-verify/35 bg-verify/10 px-2 py-0.5 text-[11px] font-semibold text-verify">OPTIONAL</span></div>
+        <p className="mt-1 text-xs leading-5 text-ink/60">默认关闭。勾选并点击生成后才会调用所选模型；所有保留内容均附原始 PDF 页码。</p>
+      </div>
+      <label className="inline-flex cursor-pointer items-center gap-2 text-sm font-semibold text-ink"><input type="checkbox" checked={enabled} onChange={(event) => onEnabledChange(event.target.checked)} className="h-4 w-4 accent-verify" />启用双语总结</label>
+    </div>
+    {enabled && <div className="border-t border-ink/15 p-4 sm:p-5">
+      {!data && summary?.status !== "failed" && <div className="flex flex-wrap items-center justify-between gap-3"><p className="max-w-2xl text-sm leading-6 text-ink/70">当前没有自动任务。选择 OpenAI、DeepSeek 或 Claude 可生成中英对照；本地验证模式不会伪造翻译，只显示可核查的原文证据。</p><button type="button" disabled={inProgress} onClick={onGenerate} className="bg-verify px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-ink disabled:cursor-not-allowed disabled:bg-verify/45">{inProgress ? "正在整理证据…" : "生成双语总结"}</button></div>}
+      {summary?.status === "failed" && <div className="flex flex-wrap items-center justify-between gap-3 border-l-4 border-marker bg-marker/10 px-4 py-3"><p className="text-sm text-ink">生成未完成：{summary.error_message || "未知错误"}</p><button type="button" onClick={onGenerate} className="text-sm font-semibold text-verify underline underline-offset-4">重试</button></div>}
+      {data && <BilingualSummaryView data={data} language={language} onLanguageChange={onLanguageChange} isRefreshing={inProgress} onRegenerate={onGenerate} />}
+    </div>}
+  </section>;
+}
+
+function BilingualSummaryView({ data, language, onLanguageChange, isRefreshing, onRegenerate }: {
+  data: BilingualSummaryData;
+  language: "both" | "zh" | "en";
+  onLanguageChange: (language: "both" | "zh" | "en") => void;
+  isRefreshing: boolean;
+  onRegenerate: () => void;
+}) {
+  const sections: Array<[string, SummaryClaim[]]> = [["核心发现", data.key_findings], ["方法", data.methods], ["局限", data.limitations]];
+  return <div>
+    <div className="mb-4 flex flex-wrap items-center justify-between gap-3"><div className="flex gap-2">{(["both", "zh", "en"] as const).map((option) => <button key={option} type="button" onClick={() => onLanguageChange(option)} className={`border px-2.5 py-1 text-xs font-semibold ${language === option ? "border-verify bg-verify text-white" : "border-ink/20 bg-white text-ink/65"}`}>{option === "both" ? "中英对照" : option === "zh" ? "仅中文" : "English"}</button>)}</div><button type="button" disabled={isRefreshing} onClick={onRegenerate} className="text-xs font-semibold text-verify underline decoration-verify/35 underline-offset-4 disabled:text-ink/35">{isRefreshing ? "正在更新…" : "使用当前模型重新生成"}</button></div>
+    {data.translation_mode === "local_verification" && <p className="mb-4 border-l-4 border-signal bg-signal/10 px-4 py-3 text-sm leading-6 text-ink">本地验证模式未调用翻译模型。为避免将原文误写为译文，中文区域只显示说明；选择已配置的云端模型后可主动重新生成。</p>}
+    <div className={`grid gap-4 ${language === "both" ? "lg:grid-cols-2" : "grid-cols-1"}`}>
+      {language !== "zh" && <SummaryColumn language="English" content={data.english_summary} citations={data.overview_citations} />}
+      {language !== "en" && <SummaryColumn language="中文" content={data.chinese_summary} citations={data.overview_citations} />}
+    </div>
+    {sections.filter(([, claims]) => claims.length > 0).map(([heading, claims]) => <section key={heading} className="mt-5 border-t border-ink/15 pt-4"><h3 className="mb-3 text-sm font-semibold text-ink">{heading}</h3><ol className="space-y-3">{claims.map((claim, index) => <li key={`${heading}-${index}`} className="border-l-2 border-verify/45 pl-3 text-sm leading-6 text-ink/80">{language !== "zh" && <p>{claim.english}</p>}{language !== "en" && <p className={language === "both" ? "mt-1 text-ink/65" : ""}>{claim.chinese}</p>}<SummaryCitationBadges citations={claim.citations} /></li>)}</ol></section>)}
+  </div>;
+}
+
+function SummaryColumn({ language, content, citations }: { language: string; content: string; citations: SummaryCitation[] }) {
+  return <article className="border border-ink/15 bg-fog/35 p-4"><p className="mb-2 text-xs font-semibold tracking-[0.12em] text-verify">{language.toUpperCase()} OVERVIEW</p><p className="whitespace-pre-wrap text-sm leading-6 text-ink/80">{content}</p><SummaryCitationBadges citations={citations} /></article>;
+}
+
+function SummaryCitationBadges({ citations }: { citations: SummaryCitation[] }) {
+  return <div className="mt-3 flex flex-wrap gap-2">{citations.map((citation) => <span key={`${citation.chunk_id}-${citation.page_number}`} title={`来源片段 ${citation.chunk_id}`} className="border border-signal/35 bg-signal/10 px-2 py-0.5 text-[11px] font-semibold text-signal">证据 p. {citation.page_number}</span>)}</div>;
 }
 
 function PaperRecord({ paper, onImport, isImporting }: { paper: Paper; onImport: (paper: Paper) => void; isImporting: boolean }) {

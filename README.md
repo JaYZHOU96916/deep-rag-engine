@@ -75,6 +75,8 @@ cp .env.example .env
 | --- | --- | --- |
 | `POST` | `/api/v1/documents` | 上传 PDF，立即返回文档 ID 与 Celery task ID |
 | `GET` | `/api/v1/documents/{document_id}` | 轮询 `pending → parsing → chunking → embedding → completed` |
+| `POST` | `/api/v1/documents/{document_id}/bilingual-summary` | 用户主动请求后，异步生成或重新生成双语总结 |
+| `GET` | `/api/v1/documents/{document_id}/bilingual-summary` | 轮询可选双语总结的 `pending → summarizing → completed` 状态 |
 | `POST` | `/api/v1/retrieval/search` | 调试混合检索与返回页码级引用 |
 | `GET` | `/api/v1/papers/institutions` | 返回已配置的学校图书馆连接器 |
 | `POST` | `/api/v1/papers/search` | 关键词或 DOI 论文发现；可附带学校 ID 生成官方访问链接 |
@@ -105,6 +107,12 @@ RRF(d) = Σ 1 / (k + rank_i(d)),  k = 60
 ### 引用完整性
 
 生成阶段包含三层防护：HyDE 仅用于检索扩展；回答提示词强制每个事实性句子以 `[Ref: ID, Page X]` 收尾；Self-RAG 审核后，服务端只允许与本次候选片段匹配的 ID/页码对进入最终答案。证据不足时返回：`检索到的参考资料中未包含关于 [具体问题] 的确切信息。`
+
+### 可选双语总结
+
+摄取完成后，工作台的“启用双语总结”开关默认关闭，**勾选开关本身不会发起模型请求**；只有用户点击“生成双语总结”才会创建 Celery 任务。长文档先按受限字符批次提炼携带 `chunk_id + page_number` 的证据笔记，再综合为英文概览、忠实中文翻译和按“核心发现 / 方法 / 局限”归档的双语条目。
+
+服务端会校验模型返回的每一个 `chunk_id + page_number` 对是否真实存在于该文档；无效引用的条目会被丢弃，概览没有有效证据时整个任务标记为失败。选择 `local` 时不会伪造翻译：系统只展示原文证据和明确提示。要生成真实中英对照，请在用户主动操作后选择已配置凭据的 OpenAI、DeepSeek 或 Claude。
 
 ## 论文发现与学校图书馆
 
@@ -153,6 +161,7 @@ data: {"text":"正文片段","cache_hit":false}
 | `EMBEDDING_MODEL`, `EMBEDDING_BASE_URL`, `EMBEDDING_API_KEY` | 生产 embedding 服务配置；维度必须与数据库的 384 维 schema 匹配。 |
 | `LLM_PROVIDER` | `local`、`openai`、`deepseek` 或 `claude`；前端也可在请求级覆盖。 |
 | `LLM_MODEL`, `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `CLAUDE_API_KEY` | LLM 路由与凭据。OpenAI / DeepSeek 使用同一兼容客户端；Claude 由统一异步适配层接入。 |
+| `BILINGUAL_SUMMARY_BATCH_CHARS` | 每个长文档证据提炼批次的最大字符数，默认 `8000`；它不启用该功能，也不触发模型调用。 |
 | `RERANKER_PROVIDER`, `RERANKER_ENDPOINT` | 设置为 `bge_http` 并指向受控 BGE/Cross-Encoder 服务以启用生产重排。 |
 | `SEMANTIC_CACHE_THRESHOLD`, `SEMANTIC_CACHE_TTL_SECONDS` | 缓存相似度阈值与存活时间。 |
 | `CORS_ORIGINS` | JSON 数组格式的允许前端来源列表。 |
@@ -162,7 +171,7 @@ data: {"text":"正文片段","cache_hit":false}
 ## 验证
 
 ```bash
-# 单元测试：递归切分、PDF 页码、RRF、语义缓存、提示词、SSE 重放、引文守卫
+# 单元测试：递归切分、PDF 页码、RRF、语义缓存、提示词、SSE 重放、引文守卫、双语总结引用校验
 docker compose --profile application run --rm --no-deps \
   -v "$PWD/backend/tests:/app/tests:ro" backend pytest -q
 
@@ -174,6 +183,8 @@ docker compose --profile application run --rm --no-deps \
   -e API_BASE_URL=http://backend:8000 backend python scripts/e2e_sse.py
 docker compose --profile application run --rm --no-deps \
   -e API_BASE_URL=http://backend:8000 backend python scripts/e2e_paper_discovery.py
+docker compose --profile application run --rm --no-deps \
+  -e API_BASE_URL=http://backend:8000 backend python scripts/e2e_bilingual_summary.py
 
 # 前端生产构建与类型检查
 cd frontend && npm ci && npm run lint && npm run build

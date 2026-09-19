@@ -5,6 +5,7 @@ from app.api.routes.documents import router as documents_router
 from app.api.routes.chat import router as chat_router
 from app.api.routes.papers import router as papers_router
 from app.api.routes.retrieval import router as retrieval_router
+from app.api.routes.summaries import router as summaries_router
 from app.core.config import get_settings
 
 settings = get_settings()
@@ -20,6 +21,7 @@ app.add_middleware(
 app.include_router(documents_router, prefix="/api/v1")
 app.include_router(papers_router, prefix="/api/v1")
 app.include_router(retrieval_router, prefix="/api/v1")
+app.include_router(summaries_router, prefix="/api/v1")
 app.include_router(chat_router, prefix="/api/v1")
 
 

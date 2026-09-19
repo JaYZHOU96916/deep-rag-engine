@@ -23,6 +23,13 @@ class IngestionStatus(StrEnum):
     FAILED = "failed"
 
 
+class SummaryStatus(StrEnum):
+    PENDING = "pending"
+    SUMMARIZING = "summarizing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 class Document(Base):
     __tablename__ = "documents"
 
@@ -59,6 +66,12 @@ class Document(Base):
         back_populates="document",
         cascade="all, delete-orphan",
         passive_deletes=True,
+    )
+    bilingual_summary: Mapped[DocumentSummary | None] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        uselist=False,
     )
 
 
@@ -99,3 +112,41 @@ class DocumentChunk(Base):
             postgresql_ops={"embedding": "halfvec_cosine_ops"},
         ),
     )
+
+
+class DocumentSummary(Base):
+    __tablename__ = "document_summaries"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    status: Mapped[SummaryStatus] = mapped_column(
+        Enum(
+            SummaryStatus,
+            name="summary_status",
+            values_callable=lambda status_enum: [member.value for member in status_enum],
+        ),
+        nullable=False,
+        default=SummaryStatus.PENDING,
+        index=True,
+    )
+    summary_data: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    source_chunk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    route_provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    route_model: Mapped[str] = mapped_column(String(200), nullable=False)
+    task_id: Mapped[str | None] = mapped_column(String(255), index=True)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    document: Mapped[Document] = relationship(back_populates="bilingual_summary")

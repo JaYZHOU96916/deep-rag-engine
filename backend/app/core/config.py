@@ -55,6 +55,7 @@ class Settings(BaseSettings):
     semantic_cache_threshold: float = 0.95
     semantic_cache_ttl_seconds: int = 86_400
     sse_replay_ttl_seconds: int = 3_600
+    bilingual_summary_batch_chars: int = Field(default=8_000, ge=2_000, le=20_000)
     llm_provider: Literal["local", "openai", "deepseek", "claude"] = "local"
     llm_model: str = "gpt-4.1-mini"
     llm_temperature: float = 0.1
