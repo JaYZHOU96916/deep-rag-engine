@@ -1,0 +1,18 @@
+{
+  "name": "deep-rag-desktop",
+  "productName": "Deep-RAG",
+  "version": "0.1.0",
+  "private": true,
+  "main": "main.cjs",
+  "description": "Local academic document research workbench",
+  "scripts": {
+    "start": "electron .",
+    "package": "electron-forge package --platform=darwin --arch=arm64",
+    "make": "electron-forge make --platform=darwin --arch=arm64"
+  },
+  "devDependencies": {
+    "electron": "44.4.4",
+    "@electron-forge/cli": "7.11.2",
+    "@electron-forge/maker-dmg": "7.11.2"
+  }
+}

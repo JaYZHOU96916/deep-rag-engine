@@ -1,7 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  output: "standalone",
+  output: process.env.DEEP_RAG_DESKTOP_EXPORT === "1" ? "export" : "standalone",
   poweredByHeader: false,
 };
 

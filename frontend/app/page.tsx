@@ -98,6 +98,20 @@ type PaperSearchResponse = {
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
 const citationPattern = /(\[Ref: ([0-9a-fA-F-]{36}), Page (\d+)\])/g;
 
+declare global {
+  interface Window {
+    deepRagDesktop?: { sessionToken: string };
+  }
+}
+
+function apiFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers);
+  if (typeof window !== "undefined" && window.deepRagDesktop) {
+    headers.set("X-Desktop-Session", window.deepRagDesktop.sessionToken);
+  }
+  return fetch(url, { ...init, headers });
+}
+
 export default function EvidenceWorkbench() {
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState("");
@@ -112,6 +126,13 @@ export default function EvidenceWorkbench() {
   const [provider, setProvider] = useState<Provider>("local");
   const [model, setModel] = useState("");
   const [documentProgress, setDocumentProgress] = useState<DocumentProgress | null>(null);
+  const [isDesktop, setIsDesktop] = useState(false);
+  const [documents, setDocuments] = useState<DocumentProgress[]>([]);
+  const [showDesktopSettings, setShowDesktopSettings] = useState(false);
+  const [configuredProviders, setConfiguredProviders] = useState<Record<string, boolean>>({});
+  const [keyProvider, setKeyProvider] = useState<"openai" | "deepseek" | "claude">("openai");
+  const [apiKeyInput, setApiKeyInput] = useState("");
+  const [settingsNotice, setSettingsNotice] = useState<string | null>(null);
   const [isBilingualSummaryEnabled, setIsBilingualSummaryEnabled] = useState(false);
   const [bilingualSummary, setBilingualSummary] = useState<BilingualSummaryResponse | null>(null);
   const [isSummaryPolling, setIsSummaryPolling] = useState(false);
@@ -136,11 +157,59 @@ export default function EvidenceWorkbench() {
 
   useEffect(() => {
     void loadInstitutions();
+    if (window.deepRagDesktop) {
+      setIsDesktop(true);
+      void loadDesktopDocuments();
+      void loadDesktopSettings();
+    }
   }, []);
+
+  async function loadDesktopDocuments() {
+    try {
+      const response = await apiFetch(`${API_BASE_URL}/api/v1/documents`);
+      if (!response.ok) return;
+      const saved = (await response.json()) as DocumentProgress[];
+      setDocuments(saved);
+      if (saved.length > 0) setDocumentProgress(saved[0]);
+    } catch {
+      setError("本机文档列表暂时无法读取。请重新打开应用。");
+    }
+  }
+
+  async function loadDesktopSettings() {
+    try {
+      const response = await apiFetch(`${API_BASE_URL}/api/v1/desktop/settings`);
+      if (response.ok) {
+        const payload = (await response.json()) as { configured_providers: Record<string, boolean> };
+        setConfiguredProviders(payload.configured_providers);
+      }
+    } catch {
+      setSettingsNotice("无法读取模型设置。");
+    }
+  }
+
+  async function saveDesktopKey(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!apiKeyInput.trim()) return;
+    try {
+      const response = await apiFetch(`${API_BASE_URL}/api/v1/desktop/settings`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: keyProvider, api_key: apiKeyInput.trim() }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = (await response.json()) as { configured_providers: Record<string, boolean> };
+      setConfiguredProviders(payload.configured_providers);
+      setApiKeyInput("");
+      setSettingsNotice(`${keyProvider} 密钥已保存到 macOS 钥匙串。`);
+    } catch {
+      setSettingsNotice("密钥保存失败。请确认 macOS 钥匙串已解锁。");
+    }
+  }
 
   async function loadInstitutions() {
     try {
-      const response = await fetch(`${API_BASE_URL}/api/v1/papers/institutions`);
+      const response = await apiFetch(`${API_BASE_URL}/api/v1/papers/institutions`);
       if (!response.ok) return;
       setInstitutions((await response.json()) as Institution[]);
     } catch {
@@ -167,7 +236,7 @@ export default function EvidenceWorkbench() {
     const body = new FormData();
     body.append("file", file);
     try {
-      const response = await fetch(`${API_BASE_URL}/api/v1/documents`, { method: "POST", body });
+      const response = await apiFetch(`${API_BASE_URL}/api/v1/documents`, { method: "POST", body });
       if (!response.ok) throw new Error(await response.text());
       const uploaded = (await response.json()) as { id: string; status: string };
       await pollDocument(uploaded.id, file.name);
@@ -179,11 +248,14 @@ export default function EvidenceWorkbench() {
 
   async function pollDocument(id: string, fallbackName: string) {
     for (let attempt = 0; attempt < 90; attempt += 1) {
-      const response = await fetch(`${API_BASE_URL}/api/v1/documents/${id}`);
+      const response = await apiFetch(`${API_BASE_URL}/api/v1/documents/${id}`);
       if (!response.ok) throw new Error("Unable to obtain ingestion progress");
       const document = (await response.json()) as DocumentProgress;
       setDocumentProgress({ ...document, original_filename: document.original_filename || fallbackName });
-      if (document.status === "completed" || document.status === "failed") return;
+      if (document.status === "completed" || document.status === "failed") {
+        if (window.deepRagDesktop) void loadDesktopDocuments();
+        return;
+      }
       await new Promise((resolve) => window.setTimeout(resolve, 1000));
     }
     setError("文档仍在处理中。稍后刷新可继续查看摄取状态。");
@@ -194,7 +266,7 @@ export default function EvidenceWorkbench() {
     setError(null);
     setIsSummaryPolling(true);
     try {
-      const response = await fetch(`${API_BASE_URL}/api/v1/documents/${documentProgress.id}/bilingual-summary`, {
+      const response = await apiFetch(`${API_BASE_URL}/api/v1/documents/${documentProgress.id}/bilingual-summary`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ route: { provider, model: model || null }, regenerate }),
@@ -212,7 +284,7 @@ export default function EvidenceWorkbench() {
 
   async function pollBilingualSummary(documentId: string) {
     for (let attempt = 0; attempt < 120; attempt += 1) {
-      const response = await fetch(`${API_BASE_URL}/api/v1/documents/${documentId}/bilingual-summary`);
+      const response = await apiFetch(`${API_BASE_URL}/api/v1/documents/${documentId}/bilingual-summary`);
       if (!response.ok) throw new Error("Unable to obtain bilingual summary progress");
       const current = (await response.json()) as BilingualSummaryResponse;
       setBilingualSummary(current);
@@ -244,7 +316,7 @@ export default function EvidenceWorkbench() {
     setPaperSearchComplete(false);
     setIsPaperSearching(true);
     try {
-      const response = await fetch(`${API_BASE_URL}/api/v1/papers/search`, {
+      const response = await apiFetch(`${API_BASE_URL}/api/v1/papers/search`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query, limit: 6, institution_id: institutionId || null }),
@@ -276,7 +348,7 @@ export default function EvidenceWorkbench() {
       error_message: null,
     });
     try {
-      const response = await fetch(`${API_BASE_URL}/api/v1/papers/import`, {
+      const response = await apiFetch(`${API_BASE_URL}/api/v1/papers/import`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ pdf_url: paper.open_access_pdf_url, title: paper.title }),
@@ -303,7 +375,7 @@ export default function EvidenceWorkbench() {
     setIsStreaming(true);
     lastEventId.current = 0;
     try {
-      const response = await fetch(`${API_BASE_URL}/api/v1/chat/stream`, {
+      const response = await apiFetch(`${API_BASE_URL}/api/v1/chat/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -328,7 +400,7 @@ export default function EvidenceWorkbench() {
     setError(null);
     setIsStreaming(true);
     try {
-      const response = await fetch(`${API_BASE_URL}/api/v1/chat/stream/${streamId}`, {
+      const response = await apiFetch(`${API_BASE_URL}/api/v1/chat/stream/${streamId}`, {
         headers: { "Last-Event-ID": String(lastEventId.current) },
       });
       if (!response.ok) throw new Error(await response.text());
@@ -365,10 +437,24 @@ export default function EvidenceWorkbench() {
           </div>
         </div>
         <div className="flex items-center gap-3 text-sm text-ink/70">
+          {isDesktop && <span className="border border-verify/30 bg-verify/5 px-2 py-1 text-xs font-semibold text-verify">本机版</span>}
           <span className="inline-flex items-center gap-2"><i className="h-2 w-2 rounded-full bg-verify" />引文约束已启用</span>
           {documentProgress?.status === "completed" && <span>{documentProgress.chunk_count} 个可检索片段</span>}
+          {isDesktop && <button type="button" onClick={() => setShowDesktopSettings((current) => !current)} className="border border-ink/20 bg-white px-3 py-1.5 text-xs font-semibold text-ink hover:border-verify">模型设置</button>}
         </div>
       </header>
+
+      {isDesktop && showDesktopSettings && <section className="mb-6 border border-ink/20 bg-paper p-5 shadow-ledger" aria-labelledby="desktop-settings-heading">
+        <div className="mb-4 flex flex-wrap items-start justify-between gap-3"><div><h2 id="desktop-settings-heading" className="text-sm font-semibold text-ink">模型设置</h2><p className="mt-1 text-xs leading-5 text-ink/60">PDF 和索引保存在这台 Mac。若要使用云端模型，在这里保存对应提供方的密钥。</p></div><button type="button" onClick={() => setShowDesktopSettings(false)} className="text-xs font-semibold text-verify underline underline-offset-4">收起</button></div>
+        <form onSubmit={saveDesktopKey} className="flex flex-wrap items-end gap-2">
+          <label className="grid gap-1 text-xs font-semibold text-ink/65">提供方<select value={keyProvider} onChange={(event) => { setKeyProvider(event.target.value as typeof keyProvider); setSettingsNotice(null); }} className="border border-ink/20 bg-white px-3 py-2 text-sm text-ink"><option value="openai">OpenAI</option><option value="deepseek">DeepSeek</option><option value="claude">Claude</option></select></label>
+          <label className="grid min-w-[220px] flex-1 gap-1 text-xs font-semibold text-ink/65">API 密钥<input type="password" value={apiKeyInput} onChange={(event) => setApiKeyInput(event.target.value)} placeholder={configuredProviders[keyProvider] ? "已保存；输入新密钥可替换" : "输入密钥"} autoComplete="new-password" className="border border-ink/20 bg-white px-3 py-2 text-sm text-ink" /></label>
+          <button type="submit" disabled={apiKeyInput.trim().length < 8} className="bg-ink px-4 py-2 text-sm font-semibold text-white disabled:bg-ink/35">保存到钥匙串</button>
+        </form>
+        {settingsNotice && <p role="status" className="mt-3 text-xs text-verify">{settingsNotice}</p>}
+      </section>}
+
+      {isDesktop && <section className="mb-6 border border-ink/20 bg-paper px-5 py-4" aria-labelledby="desktop-library-heading"><div className="mb-3 flex flex-wrap items-baseline justify-between gap-2"><h2 id="desktop-library-heading" className="text-sm font-semibold text-ink">本机文档</h2><span className="text-xs text-ink/55">{documents.length} 篇，关闭应用后仍会保留</span></div>{documents.length === 0 ? <p className="text-sm text-ink/60">尚无文档。可在下方搜索开放论文，或导入自己的 PDF。</p> : <div className="flex flex-wrap gap-2">{documents.map((document) => <button key={document.id} type="button" onClick={() => { setDocumentProgress(document); setBilingualSummary(null); setIsBilingualSummaryEnabled(false); }} className={`max-w-[330px] truncate border px-3 py-2 text-left text-xs ${documentProgress?.id === document.id ? "border-verify bg-verify/10 text-verify" : "border-ink/20 text-ink hover:border-verify"}`} title={document.original_filename}>{document.original_filename}<span className="ml-2 text-ink/45">{document.status === "completed" ? `${document.page_count ?? 0} 页` : document.status}</span></button>)}</div>}</section>}
 
       <section className="mb-6 border border-ink/20 bg-paper shadow-ledger" aria-labelledby="paper-discovery-heading">
         <div className="grid gap-5 p-5 lg:grid-cols-[minmax(0,1fr)_300px] lg:items-end">

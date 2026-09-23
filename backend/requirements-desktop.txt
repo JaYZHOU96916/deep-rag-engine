@@ -1,0 +1,3 @@
+-r requirements.txt
+keyring>=25.6,<27
+pyinstaller>=6.15,<7

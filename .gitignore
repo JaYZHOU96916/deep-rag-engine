@@ -12,6 +12,7 @@ __pycache__/
 *.so
 .Python
 .venv/
+.venv-desktop/
 venv/
 env/
 .pytest_cache/
@@ -48,3 +49,5 @@ celerybeat-schedule
 *.swp
 *.swo
 *.log
+*.dmg
+*.spec

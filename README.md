@@ -4,6 +4,35 @@ Deep-RAG 是一个以“可回到原始页码的证据”为核心的学术 PDF 
 
 > 开发环境默认启用 `local_hash` embedding 与 `local` LLM，用于无凭据的完整链路验证；它们不应作为生产语义模型。生产部署必须配置真实 Embedding 服务与所选 LLM 凭据。
 
+## macOS 桌面版（无需 Docker）
+
+仓库现在也包含 Apple Silicon macOS 桌面安装包的构建流程。桌面版将 Electron 窗口、静态导出的工作台和本机 FastAPI 服务打包在一起；双击应用即可启动，不需要先运行 Docker、PostgreSQL 或 Redis。已导入的 PDF、页码切片、问答缓存及总结状态保存在当前 macOS 用户的 `~/Library/Application Support/Deep-RAG/data/`，模型 API Key 通过 macOS 钥匙串管理。服务只监听本机回环地址，应用关闭时一并退出。
+
+若本机已有构建好的安装包，双击 `desktop/out/make/Deep-RAG.dmg`，将 Deep-RAG 拖进“应用程序”，再打开应用。首次启动需要等待内置 Python 服务解包启动。若需自行构建，请在 Apple Silicon Mac 上安装 Python 3.12+ 和 npm，然后运行：
+
+```bash
+DESKTOP_PYTHON=/path/to/python3.12 ./build-desktop.sh
+```
+
+脚本会把构建依赖放在被 Git 忽略的 `.venv-desktop/` 中，使用固定的 Node 22 运行 Electron Forge，最后生成 `desktop/out/make/Deep-RAG.dmg`。如需单独验证打包后的 API，可在两个终端依次运行：
+
+```bash
+# 终端 1：启动打包后的本地服务（Ctrl+C 结束）
+DEEP_RAG_DESKTOP_DATA_DIR="$(mktemp -d)" \
+DEEP_RAG_DESKTOP_FRONTEND_DIR="$PWD/frontend/out" \
+DEEP_RAG_DESKTOP_SESSION_TOKEN=your-test-token \
+DEEP_RAG_DESKTOP_PORT=8769 backend/dist/deep-rag-api/deep-rag-api
+
+# 终端 2：验证 PDF 摄取、检索、Typed SSE 与可选总结
+DESKTOP_TEST_TOKEN=your-test-token \
+DESKTOP_TEST_API_BASE_URL=http://127.0.0.1:8769 \
+PYTHONPATH=backend .venv-desktop/bin/python backend/scripts/e2e_desktop.py
+```
+
+构建脚本本身会完成应用打包与签名验证。桌面版目前使用 SQLite、本机 `local_hash` 检索和轻量重排序；它是离线可运行的功能基线，语义检索质量不等同于 Docker 部署的 pgvector + 可配置生产级模型。选择 OpenAI、DeepSeek 或 Claude 后，可在桌面界面的“模型密钥”处保存对应密钥；论文在线搜索、开放 PDF 导入和远程模型仍需要网络。双语总结保持默认关闭，只有主动点击才会生成。
+
+当前安装包采用临时 ad-hoc 签名，**未完成 Apple Developer ID 签名和公证**；适合本机验证，尚不能作为面向公众的正式下载发行版。正式发布前需配置开发者证书、公证与分发测试。现有 Docker 网页版不受桌面版构建流程影响。
+
 ## 能力概览
 
 - PDF 经 Celery 异步处理：PyMuPDF 按页抽取、递归语义切片、页码元数据与 `halfvec` embedding 一同写入 PostgreSQL。
